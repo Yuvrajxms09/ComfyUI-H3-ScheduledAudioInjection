@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Mapping
 
 import torch
@@ -16,6 +17,7 @@ _WRAPPER_KEY = "minimax_h3_scheduled_audio_injection"
 _STATE_KEY = "minimax_h3_scheduled_audio_injection_state"
 _H3_AUDIO_RATE = 32_000
 _H3_AUDIO_LATENT_RATE = 40
+_LOGGER = logging.getLogger(__name__)
 
 
 def _validate_audio(audio: Mapping[str, Any], name: str) -> tuple[torch.Tensor, int]:
@@ -77,6 +79,8 @@ def _encode_for_template(audio_vae, audio: Mapping[str, Any], template: torch.Te
 class _ScheduledAudioState:
     clean_cpu: torch.Tensor
     noise_cpu: torch.Tensor
+    debug: bool = False
+    calls: int = 0
 
     def tensors_like(self, reference: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if tuple(reference.shape) != tuple(self.clean_cpu.shape):
@@ -124,6 +128,16 @@ def _scheduled_audio_wrapper(
 
     clean, fixed_noise = state.tensors_like(audio_x)
     scheduled_audio = (1.0 - sigma_a) * clean + sigma_a * fixed_noise
+    if state.debug:
+        state.calls += 1
+        _LOGGER.warning(
+            "[H3 scheduled injection] forward=%d sigma_video=%.6f sigma_audio=%.6f "
+            "clean_shape=%s",
+            state.calls,
+            float(sigma_v),
+            float(sigma_a),
+            tuple(clean.shape),
+        )
     return executor(
         [video_x, scheduled_audio],
         timestep,
@@ -149,6 +163,7 @@ class MiniMaxH3ScheduledAudioInjection:
                     "INT",
                     {"default": 0, "min": 0, "max": 0x7FFFFFFFFFFFFFFF},
                 ),
+                "debug": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "mux_audio": ("AUDIO",),
@@ -165,7 +180,7 @@ class MiniMaxH3ScheduledAudioInjection:
         "mux_audio passes through unchanged for final delivery."
     )
 
-    def inject(self, model, av_latent, audio_vae, drive_audio, noise_seed, mux_audio=None):
+    def inject(self, model, av_latent, audio_vae, drive_audio, noise_seed, debug=False, mux_audio=None):
         samples = av_latent.get("samples") if isinstance(av_latent, Mapping) else None
         if samples is None or not getattr(samples, "is_nested", False):
             raise ValueError("Scheduled audio injection requires a joint MiniMax H3 AV latent")
@@ -185,7 +200,18 @@ class MiniMaxH3ScheduledAudioInjection:
         clean_cpu = clean.detach().to(device="cpu", dtype=torch.float32).contiguous()
         generator = torch.Generator(device="cpu").manual_seed(int(noise_seed))
         fixed_noise = torch.randn(clean_cpu.shape, generator=generator, dtype=torch.float32)
-        state = _ScheduledAudioState(clean_cpu=clean_cpu, noise_cpu=fixed_noise)
+        state = _ScheduledAudioState(
+            clean_cpu=clean_cpu,
+            noise_cpu=fixed_noise,
+            debug=bool(debug),
+        )
+        if debug:
+            _LOGGER.warning(
+                "[H3 scheduled injection] prepared clean target shape=%s mean=%.6f std=%.6f",
+                tuple(clean_cpu.shape),
+                float(clean_cpu.mean()),
+                float(clean_cpu.std()),
+            )
 
         locked = dict(av_latent)
         locked["samples"] = comfy.nested_tensor.NestedTensor((video, clean))
@@ -214,10 +240,51 @@ class MiniMaxH3ScheduledAudioInjection:
         return patched, locked, delivered_audio
 
 
+class MiniMaxH3DiffusersSchedule:
+    """Build the exact shifted sigma grid used by the reference Diffusers H3 pipeline."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "num_inference_steps": (
+                    "INT",
+                    {"default": 20, "min": 2, "max": 1000},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("SIGMAS",)
+    RETURN_NAMES = ("sigmas",)
+    FUNCTION = "build"
+    CATEGORY = "MiniMax H3/Sampling"
+    DESCRIPTION = (
+        "Matches MiniMaxH3Scheduler.set_timesteps(): num_inference_steps includes the terminal "
+        "zero sigma, so 20 grid points produce 19 model evaluations."
+    )
+
+    def build(self, model, num_inference_steps):
+        options = model.model_options.get("transformer_options", {})
+        shift = options.get("minimax_h3_sigma_shift_video")
+        if shift is None:
+            model_sampling = model.get_model_object("model_sampling")
+            shift = getattr(model_sampling, "shift", 12.0)
+        shift = float(shift)
+        if shift <= 0:
+            raise ValueError(f"MiniMax H3 video sigma shift must be positive, got {shift}")
+
+        base = torch.linspace(1.0, 0.0, int(num_inference_steps), dtype=torch.float32)
+        sigmas = shift * base / (1.0 + (shift - 1.0) * base)
+        return (torch.unique_consecutive(sigmas),)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3ScheduledAudioInjection": MiniMaxH3ScheduledAudioInjection,
+    "MiniMaxH3DiffusersSchedule": MiniMaxH3DiffusersSchedule,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3ScheduledAudioInjection": "MiniMax H3 Scheduled Audio Injection",
+    "MiniMaxH3DiffusersSchedule": "MiniMax H3 Diffusers Schedule",
 }

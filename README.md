@@ -11,8 +11,17 @@ This custom node ports the `scheduled` replacement method from
 - uses a zero audio noise mask as the hard final-latent preservation layer;
 - optionally passes a separate untouched `mux_audio` to the video output.
 
+`MiniMaxH3DiffusersSchedule` reproduces the reference MiniMax-H3 Diffusers sigma grid. The
+reference pipeline's `num_inference_steps=20` contains the terminal zero and therefore performs
+19 model evaluations. Connect this node to an Euler sampler when comparing against the gallery.
+
 The separate mux input is useful when a vocal stem drives lip movement while the original mix is
 the delivered soundtrack.
+
+For the closest gallery comparison, use the full BF16 FL2VA checkpoint, 124 frames at 960x544,
+20 Diffusers schedule grid points, Euler, direct 32 kHz-compatible speech input, and quote the
+recording verbatim as `<d>[English] ...</d>` in the prompt. Quantized/pruned checkpoints and
+speech without a matching transcript are materially different test conditions.
 
 ## Install
 
