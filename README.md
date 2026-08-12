@@ -5,9 +5,10 @@ This custom node ports the `scheduled` replacement method from
 
 `MiniMaxH3ScheduledAudioInjection`:
 
-- encodes `drive_audio` into the target H3 audio grid;
+- truncates `drive_audio` at its native sample rate, resamples once to 32 kHz stereo, and encodes it into the target H3 audio grid;
 - pads short conditioning audio with waveform silence before VAE encoding;
-- injects `x_t = (1 - sigma_audio) * x0 + sigma_audio * fixed_noise` before every H3 forward;
+- draws fixed noise in Diffusers' packed `[stereo * time, channels]` row order;
+- computes `x_t = (1 - sigma_audio) * x0 + sigma_audio * fixed_noise` in fp32, then injects it before every H3 forward;
 - uses a zero audio noise mask as the hard final-latent preservation layer;
 - optionally passes a separate untouched `mux_audio` to the video output.
 
@@ -29,10 +30,23 @@ H3, and each first frame was harvested from an H3 video at the target 960x544 ca
 of those exact image/audio/prompt cases first. If that matches but an arbitrary portrait or recording
 does not, the remaining gap is input generalization rather than the scheduled-injection port.
 
+Native ComfyUI and the pinned Diffusers implementation do not currently encode FL2VA keyframes
+identically. Diffusers samples the video-VAE posterior with seed `42` and rounds it through fp16;
+ComfyUI's native H3 video VAE uses the posterior mean. This node matches the published scheduled
+audio replacement, preprocessing order, fixed-noise layout, and sigma grid, but it does not replace
+ComfyUI's first-frame conditioning implementation. Consequently, matching injection seed `0` does
+not imply pixel-identical video output across the two runtimes.
+
 ## Install
 
 Copy this folder directly into `ComfyUI/custom_nodes/` and restart ComfyUI. Do not place it inside
 another custom-node folder. It uses only PyTorch, torchaudio, and ComfyUI's built-in APIs.
+
+Run the parity tests from an environment that already has ComfyUI's normal dependencies:
+
+```bash
+PYTHONPATH=/path/to/ComfyUI python -m unittest discover -s tests -v
+```
 
 ## Scope
 

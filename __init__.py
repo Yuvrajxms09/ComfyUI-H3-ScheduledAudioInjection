@@ -43,26 +43,60 @@ def _to_stereo(waveform: torch.Tensor) -> torch.Tensor:
     if channels == 2:
         return waveform
     if channels == 1:
-        return waveform.expand(-1, 2, -1)
-    return waveform.mean(dim=1, keepdim=True).expand(-1, 2, -1)
+        return waveform.expand(-1, 2, -1).contiguous()
+    raise ValueError(
+        "drive_audio must be mono or stereo; downmix audio with more than two channels explicitly"
+    )
 
 
-def _encode_for_template(audio_vae, audio: Mapping[str, Any], template: torch.Tensor) -> torch.Tensor:
+def _prepare_waveform(
+    audio: Mapping[str, Any],
+    *,
+    target_latents: int,
+    target_sample_rate: int,
+) -> torch.Tensor:
     waveform, sample_rate = _validate_audio(audio, "drive_audio")
-    vae_rate = int(getattr(audio_vae, "audio_sample_rate", _H3_AUDIO_RATE))
-    if vae_rate != _H3_AUDIO_RATE:
-        raise ValueError(f"MiniMax H3 audio VAE must run at 32000 Hz, got {vae_rate}")
+    if sample_rate <= 0:
+        raise ValueError(f"drive_audio sample_rate must be positive, got {sample_rate}")
+    if target_latents <= 0:
+        raise ValueError(f"H3 target audio grid must be non-empty, got {target_latents}")
+    if target_sample_rate <= 0 or target_sample_rate % _H3_AUDIO_LATENT_RATE:
+        raise ValueError(
+            "H3 target sample rate must be a positive multiple of "
+            f"{_H3_AUDIO_LATENT_RATE}, got {target_sample_rate}"
+        )
 
-    waveform = _to_stereo(waveform[:1]).to(dtype=torch.float32)
-    if sample_rate != vae_rate:
-        waveform = torchaudio.functional.resample(waveform, sample_rate, vae_rate)
+    # Match Diffusers' prepare_reference_waveform contract: truncate at the
+    # source rate first, upmix, then perform exactly one resample.
+    source_samples = int(target_latents / _H3_AUDIO_LATENT_RATE * sample_rate)
+    if source_samples <= 0:
+        raise ValueError(
+            f"drive_audio sample rate {sample_rate} is too low for the H3 target grid"
+        )
+    waveform = waveform[:1, :, :source_samples].to(device="cpu", dtype=torch.float32)
+    waveform = _to_stereo(waveform)
+    if sample_rate != target_sample_rate:
+        waveform = torchaudio.transforms.Resample(sample_rate, target_sample_rate)(waveform)
 
-    samples_per_latent = vae_rate // _H3_AUDIO_LATENT_RATE
-    target_samples = int(template.shape[-1]) * samples_per_latent
+    samples_per_latent = target_sample_rate // _H3_AUDIO_LATENT_RATE
+    target_samples = target_latents * samples_per_latent
     if waveform.shape[-1] < target_samples:
         waveform = F.pad(waveform, (0, target_samples - waveform.shape[-1]))
     else:
         waveform = waveform[..., :target_samples]
+    return waveform.contiguous()
+
+
+def _encode_for_template(audio_vae, audio: Mapping[str, Any], template: torch.Tensor) -> torch.Tensor:
+    vae_rate = int(getattr(audio_vae, "audio_sample_rate", _H3_AUDIO_RATE))
+    if vae_rate != _H3_AUDIO_RATE:
+        raise ValueError(f"MiniMax H3 audio VAE must run at 32000 Hz, got {vae_rate}")
+
+    waveform = _prepare_waveform(
+        audio,
+        target_latents=int(template.shape[-1]),
+        target_sample_rate=vae_rate,
+    )
 
     encoded = audio_vae.encode(waveform.movedim(1, -1).contiguous())
     if not isinstance(encoded, torch.Tensor) or encoded.ndim != 4:
@@ -73,6 +107,29 @@ def _encode_for_template(audio_vae, audio: Mapping[str, Any], template: torch.Te
             f"encoded={tuple(encoded.shape)}, target={tuple(template.shape)}"
         )
     return encoded.to(device=template.device, dtype=template.dtype)
+
+
+def _fixed_noise_like(clean: torch.Tensor, noise_seed: int) -> torch.Tensor:
+    if clean.ndim != 4 or clean.shape[0] != 1 or clean.shape[2] != 2:
+        raise ValueError(
+            "H3 clean audio must have shape [1, channels, stereo 2, time], "
+            f"got {tuple(clean.shape)}"
+        )
+
+    channels = int(clean.shape[1])
+    stereo = int(clean.shape[2])
+    frames = int(clean.shape[3])
+    generator = torch.Generator(device="cpu").manual_seed(int(noise_seed))
+
+    # Diffusers draws epsilon after packing audio as [stereo * time, channels].
+    # Draw in that order, then restore Comfy's [1, channels, stereo, time] layout.
+    packed = torch.randn(
+        (stereo * frames, channels),
+        generator=generator,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    return packed.reshape(stereo, frames, channels).permute(2, 0, 1).unsqueeze(0).contiguous()
 
 
 @dataclass
@@ -88,8 +145,10 @@ class _ScheduledAudioState:
                 "Scheduled audio shape changed after graph preparation: "
                 f"runtime={tuple(reference.shape)}, prepared={tuple(self.clean_cpu.shape)}"
             )
-        clean = self.clean_cpu.to(device=reference.device, dtype=reference.dtype)
-        noise = self.noise_cpu.to(device=reference.device, dtype=reference.dtype)
+        # Diffusers performs the forward-process blend in fp32, then casts the
+        # resulting rows to the transformer's runtime dtype.
+        clean = self.clean_cpu.to(device=reference.device, dtype=torch.float32)
+        noise = self.noise_cpu.to(device=reference.device, dtype=torch.float32)
         return clean, noise
 
 
@@ -127,7 +186,7 @@ def _scheduled_audio_wrapper(
     sigma_a = time_shift_sigma(sigma_v, shift_v, shift_a).clamp(0.0, 1.0)
 
     clean, fixed_noise = state.tensors_like(audio_x)
-    scheduled_audio = (1.0 - sigma_a) * clean + sigma_a * fixed_noise
+    scheduled_audio = ((1.0 - sigma_a) * clean + sigma_a * fixed_noise).to(audio_x.dtype)
     if state.debug:
         state.calls += 1
         _LOGGER.warning(
@@ -198,8 +257,7 @@ class MiniMaxH3ScheduledAudioInjection:
 
         clean = _encode_for_template(audio_vae, drive_audio, audio_template)
         clean_cpu = clean.detach().to(device="cpu", dtype=torch.float32).contiguous()
-        generator = torch.Generator(device="cpu").manual_seed(int(noise_seed))
-        fixed_noise = torch.randn(clean_cpu.shape, generator=generator, dtype=torch.float32)
+        fixed_noise = _fixed_noise_like(clean_cpu, noise_seed)
         state = _ScheduledAudioState(
             clean_cpu=clean_cpu,
             noise_cpu=fixed_noise,
